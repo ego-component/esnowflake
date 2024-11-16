@@ -2,6 +2,7 @@ package esnowflake
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -56,6 +57,28 @@ func TestGenerateByRandom_HandlesPoolRefill(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		config.GenerateByRandom()
 	}
+}
+
+func TestGenerateByRandom_ConcurrencyNotEqual(t *testing.T) {
+	config := New("192.168.1.1", 1, 2, 3)
+	testLength := 1000000
+	output := sync.Map{}
+	// 测试并发生成随机数，是否重复
+	wg := sync.WaitGroup{}
+	wg.Add(testLength)
+	for i := 0; i < testLength; i++ {
+		go func() {
+			id := config.GenerateByRandom()
+			_, flag := output.Load(id)
+			if flag {
+				t.Errorf("Expected unique IDs, but got %s and %s", id, id)
+			}
+			output.Store(id, struct{}{})
+			wg.Done()
+		}()
+
+	}
+	wg.Wait()
 }
 
 func TestGenerateByRandom_GetTime(t *testing.T) {
