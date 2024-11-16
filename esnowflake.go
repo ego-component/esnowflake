@@ -1,15 +1,31 @@
 /*
+Random
+* 1                                             41                           65                                                                       128
+* +---------------------------------------------+----------------------------+--------------------------------------------------------------------------+
+* | timestamp(ms)                                | worker info                | random number                                                            |
+* +---------------------------------------------+----------------------------+--------------------------------------------------------------------------+
+* | 00000000 00000000 00000000 00000000 00000000 | 00000000 00000000 00000000 | 00000000 00000000 00000000 00000000 00000000 00000000 | 00000000 00000000 |
+* +---------------------------------------------+----------------------------+--------------------------------------------------------------------------+
+*
+* 1. 40 位时间截(毫秒级)，注意这是时间截的差值（当前时间截 - 开始时间截)。可以使用约 34 年: (1L << 40) / (1000L * 60 * 60 * 24 * 365) = 34。（2020-2054）
+* 2. 24 位 worker info 数据，适应 k8s 环境。
+* 3. 64 随机数
+*/
+
+/*
+Sequence
 * 1                                             41                           65                                                     113                128
 * +---------------------------------------------+----------------------------+------------------------------------------------------+-------------------+
-* | timestamp(ms)                               | worker info                | random number                                        | sequence          |
+* | timestamp(ms)                                | worker info                | random number                                        | sequence          |
 * +---------------------------------------------+----------------------------+------------------------------------------------------+-------------------+
-* | 0000000000 0000000000 0000000000 0000000000 | 0000000000 0000000000 0000 | 0000000000 0000000000 0000000000 0000000000 00000000 | 00000000 00000000 |
+* | 00000000 00000000 00000000 00000000 00000000 | 00000000 00000000 00000000 | 00000000 00000000 00000000 00000000 00000000 00000000 | 00000000 00000000 |
 * +---------------------------------------------+----------------------------+------------------------------------------------------+-------------------+
 *
 * 1. 40 位时间截(毫秒级)，注意这是时间截的差值（当前时间截 - 开始时间截)。可以使用约 34 年: (1L << 40) / (1000L * 60 * 60 * 24 * 365) = 34。（2020-2054）
 * 2. 24 位 worker info 数据，适应 k8s 环境。
 * 3. 64 随机数
- */
+* 4. 16 位 sequence
+*/
 
 package esnowflake
 
@@ -29,18 +45,17 @@ const (
 	workerInfoBits = uint(24)             // 机器 ip 所占的位数
 )
 
-const randPoolSequenceSize = 8 * 6
-const randPoolRandomSize = 8 * 6
+const randPoolSequenceRandomSize = 6 * 256
+const randPoolRandomSize = 8 * 64 * 3
 
 var (
-	rander          = rand.Reader              // random function
-	poolSequencePos = randPoolSequenceSize     // protected with poolMu
-	poolSequence    [randPoolSequenceSize]byte // protected with poolMu
-	poolRandomPos   = randPoolRandomSize       // protected with poolMu
-	poolRandom      [randPoolRandomSize]byte   // protected with poolMu
-	//mask         = [3]byte{123, 45, 67}
-	sequenceBits = uint(16)                         // 序列所占的位数
-	sequenceMask = int64(-1 ^ (-1 << sequenceBits)) //
+	rander                = rand.Reader                      // random function
+	poolSequenceRandomPos = randPoolSequenceRandomSize       // protected with poolMu
+	poolSequenceRandom    [randPoolSequenceRandomSize]byte   // protected with poolMu
+	poolRandomPos         = randPoolRandomSize               // protected with poolMu
+	poolRandom            [randPoolRandomSize]byte           // protected with poolMu
+	sequenceBits          = uint(16)                         // 序列所占的位数
+	sequenceMask          = int64(-1 ^ (-1 << sequenceBits)) //
 
 )
 
@@ -54,6 +69,9 @@ type Config struct {
 	sequence  int64
 }
 
+// New create a new snowflake node with a unique worker id.
+// ip 你的机器 ip
+// mask1, mask2, mask3 你自己填的随机数，用于混淆 ip
 func New(ip string, mask1, mask2, mask3 uint8) *Config {
 	b := net.ParseIP(ip).To4()
 	if b == nil {
@@ -71,11 +89,15 @@ func New(ip string, mask1, mask2, mask3 uint8) *Config {
 	return &obj
 }
 
+// GenerateByRandom 生成一个唯一的 id， 这个性能比较好，只有非常低的被碰撞概率，我们认为可以忽略不计
 func (s *Config) GenerateByRandom() string {
 	buf := make([]byte, 16)
 	s.Lock()
 	now := time.Now().UnixNano() / 1000000
 	if poolRandomPos == randPoolRandomSize {
+		// 生成48个字节的随机数
+		// 下面在buf中，每次取8个字节
+		// 如果 poolRandomPos 到达最大值，重新生成随机数，并将 poolRandomPos 置为 0
 		_, err := io.ReadFull(rander, poolRandom[:])
 		if err != nil {
 			s.Unlock()
@@ -107,18 +129,23 @@ func (s *Config) GenerateBySequence() string {
 	}
 	s.timestamp = now
 
-	if poolSequencePos == randPoolSequenceSize {
-		_, err := io.ReadFull(rander, poolSequence[:])
+	// 生成48个字节的随机数
+	// 下面在buf中，每次取6个字节
+	// 如果 poolSequenceRandomPos 到达最大值，重新生成随机数，并将 poolSequenceRandomPos 置为 0
+	if poolSequenceRandomPos == randPoolSequenceRandomSize {
+		_, err := io.ReadFull(rander, poolSequenceRandom[:])
 		if err != nil {
 			s.Unlock()
 			panic(err)
 		}
-		poolSequencePos = 0
+		poolSequenceRandomPos = 0
 	}
 	copy(buf[:5], Uint64ToBytes(uint64(now-twepoch) << workerInfoBits)[:5])
 	copy(buf[5:8], s.ip)
-	copy(buf[8:14], poolSequence[poolSequencePos:(poolSequencePos+7)])
-	poolSequencePos += 7
+	// 随机数
+	copy(buf[8:14], poolSequenceRandom[poolSequenceRandomPos:(poolSequenceRandomPos+6)])
+	poolSequenceRandomPos += 6
+	// sequence
 	copy(buf[14:], Uint64ToBytes(uint64(s.sequence)))
 	s.Unlock()
 	return base64.RawURLEncoding.EncodeToString(buf)
